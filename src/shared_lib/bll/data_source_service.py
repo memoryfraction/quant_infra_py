@@ -37,9 +37,9 @@ class BinanceFuturesUSDTClient:
         # 预计算步长（毫秒）
         self.step_ms = int(self.binance.parse_timeframe(self.interval) * 1000)
 
-    def fetch_usdt_perp_symbols(self) -> List[str]:
+    def fetch_usdt_perp_symbols(self, top_n: int = 50) -> List[str]:
         """
-        获取所有 USDT 计价的永续合约符号
+        获取所有 USDT 计价的永续合约符号，并根据市值排序选出前 N 名
         """
         markets = getattr(self.binance, "markets", None)
         if not markets:
@@ -47,6 +47,8 @@ class BinanceFuturesUSDTClient:
             markets = self.binance.markets or {}
 
         syms: List[str] = []
+        market_data = []  # 用来存储市场符号及其市值（假设市值是通过交易量推算的）
+
         logger.debug(f"Loaded markets: {markets}")  # 打印加载的市场数据
 
         for m in markets.values():
@@ -66,8 +68,17 @@ class BinanceFuturesUSDTClient:
 
             sym = m["symbol"]  # 形如 "BTC/USDT" 或 "BTC/USDT:USDT"
 
-            # 允许带冒号的合约，不排除带冒号的符号
-            syms.append(sym)
+            # 假设我们使用市场的 `volume` 或其他字段作为市值的代理
+            volume = float(m.get("volume", 0))  # 取交易量作为排序依据
+
+            # 将符号和市值放入列表
+            market_data.append((sym, volume))
+
+        # 按市值排序，降序
+        market_data.sort(key=lambda x: x[1], reverse=True)
+
+        # 选择前 top_n 个合约
+        syms = [sym for sym, _ in market_data[:top_n]]
 
         # 打印筛选后的永续合约符号
         logger.debug(f"Filtered perpetual symbols: {syms}")
@@ -75,6 +86,7 @@ class BinanceFuturesUSDTClient:
         logger.info(f"USDT-M 永续候选数：{len(syms)}")
         if not syms:
             logger.warning("未获取到 USDT-M 永续合约列表。")
+
         return syms
 
     def top_by_quote_volume(self, pool: List[str], topn: int = 200) -> List[str]:
@@ -301,8 +313,6 @@ def fetch_top50_last_year_1h_history_ge_1y(pad_missing: bool = False,
         except Exception as e:
             logger.warning(f"{sym}: failed, skip. {e}")
             continue
-
     return saved
-
 
 
