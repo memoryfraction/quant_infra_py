@@ -1,175 +1,269 @@
+import os
 import time
 import logging
-import requests
-import pandas as pd
 from datetime import datetime, timedelta
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter
+from typing import Optional, Dict, List, Tuple
+
+import pandas as pd
+import ccxt
 
 logger = logging.getLogger(__name__)
 
-# Binance USDT-M 期货备用域名
-FAPI_BASES = [
-    "https://fapi.binance.com",
-    "https://fapi1.binance.com",
-    "https://fapi2.binance.com",
-    "https://fapi3.binance.com",
-]
+MAX_LIMIT = 1500  # 单次 OHLCV 最大条数（ccxt->binance 支持到 1500）
+TARGET_ROWS_1Y_1H = 8760  # 1 年 * 24 小时
 
-MAX_LIMIT = 1500            # /fapi/v1/klines 单次最大条数
-TARGET_ROWS_1Y_1H = 8760    # 1年*24小时
 
+# -------------------- Binance USDT-M 永续客户端（基于 ccxt） -------------------- #
 class BinanceFuturesUSDTClient:
-    def __init__(self, interval="1h", timeout=10, proxies=None):
+    """
+    使用 ccxt 的 binanceusdm 客户端，限定在 USDT-M 永续（contract, linear, expiry=None）市场。
+    """
+
+    def __init__(self, interval: str = "1h", proxies: Optional[Dict[str, str]] = None):
         self.interval = interval
-        self.timeout = timeout
-        self.base_index = 0
 
-        self.sess = requests.Session()
-        retries = Retry(
-            total=5, connect=5, read=5,
-            backoff_factor=0.6,
-            status_forcelist=[429, 500, 502, 503, 504],
-            allowed_methods=["GET"],
-        )
-        self.sess.headers.update({"User-Agent": "Mozilla/5.0 (data-fetcher/1.2)"})
-        self.sess.mount("https://", HTTPAdapter(max_retries=retries))
+        # ✅ 直接使用 USDⓈ-M 期货实例，更稳
+        self.binance = ccxt.binanceusdm({
+            "enableRateLimit": True,
+        })
+
         if proxies:
-            self.sess.proxies.update(proxies)
+            # 设置代理（Clash 的代理端口 7897）
+            self.binance.proxies = proxies
 
-    @property
-    def base(self):
-        return FAPI_BASES[self.base_index % len(FAPI_BASES)]
+        # ✅ 显式加载市场，避免 self.binance.markets 为 None
+        self.binance.load_markets(reload=True)
 
-    def _get_json(self, path, params=None):
-        for _ in range(len(FAPI_BASES)):
-            url = f"{self.base}{path}"
-            try:
-                r = self.sess.get(url, params=params, timeout=self.timeout)
-                r.raise_for_status()
-                return r.json()
-            except requests.exceptions.SSLError as e:
-                logger.warning(f"SSL error on {url}, switch endpoint: {e}")
-                self.base_index += 1; time.sleep(0.3)
-            except requests.RequestException as e:
-                logger.warning(f"HTTP error on {url}, switch endpoint: {e}")
-                self.base_index += 1; time.sleep(0.3)
-        raise RuntimeError(f"All endpoints failed for {path} with {params}")
+        # 预计算步长（毫秒）
+        self.step_ms = int(self.binance.parse_timeframe(self.interval) * 1000)
 
-    # ---------- 符号 & 排序 ----------
-    def fetch_usdt_perp_symbols(self):
-        """USDT 报价、永续、TRADING（来自期货端 exchangeInfo）"""
-        info = self._get_json("/fapi/v1/exchangeInfo")
-        out = []
-        for s in info.get("symbols", []):
-            if s.get("status") == "TRADING" and s.get("quoteAsset") == "USDT" and s.get("contractType") == "PERPETUAL":
-                out.append(s["symbol"])
-        return out
+    def fetch_usdt_perp_symbols(self, top_n: int = 50) -> List[str]:
+        """
+        获取所有 USDT 计价的永续合约符号，并根据市值排序选出前 N 名
+        """
+        markets = getattr(self.binance, "markets", None)
+        if not markets:
+            self.binance.load_markets(reload=True)
+            markets = self.binance.markets or {}
 
-    def top_by_quote_volume(self, pool, topn=200):
-        """在给定符号池 pool 中，按 24h quoteVolume 降序取前 topn"""
-        stats = self._get_json("/fapi/v1/ticker/24hr")
+        syms: List[str] = []
+        market_data = []  # 用来存储市场符号及其市值（假设市值是通过交易量推算的）
+
+        logger.debug(f"Loaded markets: {markets}")  # 打印加载的市场数据
+
+        for m in markets.values():
+            logger.debug(f"Market: {m}")  # 打印每个合约的详细信息
+
+            # 只获取 USDT 计价的合约
+            if m.get("quote") != "USDT":
+                continue
+
+            # 确保是永续合约，contractType 为 'PERPETUAL'，在 info 字段中
+            if m.get("info", {}).get("contractType") != "PERPETUAL":
+                continue
+
+            # 排除非活跃的合约
+            if m.get("active") is False:
+                continue
+
+            sym = m["symbol"]  # 形如 "BTC/USDT" 或 "BTC/USDT:USDT"
+
+            # 假设我们使用市场的 `volume` 或其他字段作为市值的代理
+            volume = float(m.get("volume", 0))  # 取交易量作为排序依据
+
+            # 将符号和市值放入列表
+            market_data.append((sym, volume))
+
+        # 按市值排序，降序
+        market_data.sort(key=lambda x: x[1], reverse=True)
+
+        # 选择前 top_n 个合约
+        syms = [sym for sym, _ in market_data[:top_n]]
+
+        # 打印筛选后的永续合约符号
+        logger.debug(f"Filtered perpetual symbols: {syms}")
+
+        logger.info(f"USDT-M 永续候选数：{len(syms)}")
+        if not syms:
+            logger.warning("未获取到 USDT-M 永续合约列表。")
+
+        return syms
+
+    def top_by_quote_volume(self, pool: List[str], topn: int = 200) -> List[str]:
+        """
+        在 pool 中，按 24h 报价量（quoteVolume）降序，返回前 topn。
+        若 fetch_tickers 返回为空/字段缺失，会退化为按 pool 的顺序截取。
+        """
         pool_set = set(pool)
-        rows = [d for d in stats if d.get("symbol") in pool_set]
-        rows.sort(key=lambda x: float(x.get("quoteVolume", "0") or 0.0), reverse=True)
-        return [r["symbol"] for r in rows[:topn]]
+        rows: List[Tuple[str, float]] = []
 
-    # K线
+        try:
+            tickers = self.binance.fetch_tickers()
+        except Exception as e:
+            logger.warning(f"fetch_tickers 失败，降级使用 pool 顺序。原因：{e}")
+            return pool[:topn]
+
+        for sym, t in tickers.items():
+            if sym not in pool_set:
+                continue
+
+            # 统一字段
+            qv = t.get("quoteVolume")
+            # 原始 info 兜底
+            if qv is None:
+                info = t.get("info") or {}
+                qv = info.get("quoteVolume")
+            # 最后兜底：last * baseVolume
+            if qv is None:
+                last = t.get("last") or 0
+                base_vol = t.get("baseVolume") or 0
+                try:
+                    qv = float(last) * float(base_vol)
+                except Exception:
+                    qv = 0.0
+
+            try:
+                qv_float = float(qv or 0.0)
+            except Exception:
+                qv_float = 0.0
+
+            rows.append((sym, qv_float))
+
+        if not rows:
+            logger.warning("tickers 中无匹配到的 USDT-M 永续，降级使用 pool 顺序。")
+            return pool[:topn]
+
+        rows.sort(key=lambda x: x[1], reverse=True)
+        return [sym for sym, _ in rows[:topn]]
+
+    # ---------- OHLCV 处理 ---------- #
     @staticmethod
-    def _klines_to_df(raw):
-        cols = ['timestamp', 'open', 'high', 'low', 'close', 'volume',
-                'close_time', 'quote_asset_volume', 'number_of_trades',
-                'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore']
+    def _ohlcv_to_df(raw: List[List]) -> pd.DataFrame:
+        """
+        ccxt.fetch_ohlcv 返回 [ts, open, high, low, close, volume]（6列）。
+        这里统一清洗：只取前 6 列，转成 DataFrame，并输出标准列。
+        """
         if not isinstance(raw, list) or not raw:
             return pd.DataFrame(columns=["DateTime", "open", "high", "low", "close", "volume"])
 
-        df = pd.DataFrame(raw, columns=cols)
+        cleaned: List[List] = []
+        for row in raw:
+            if not isinstance(row, (list, tuple)) or len(row) < 6:
+                continue
+            cleaned.append(row[:6])
 
-        # 对 Series 用 .dt 访问器来去时区
+        if not cleaned:
+            return pd.DataFrame(columns=["DateTime", "open", "high", "low", "close", "volume"])
+
+        df = pd.DataFrame(cleaned, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        # 转时间（UTC）并去掉时区，统一用“UTC 上的 naive 时间”
         dt_utc = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
         df["DateTime"] = dt_utc.dt.tz_localize(None)
 
-        # 可选：把数值列转为浮点，避免后续 pad/reindex 出现类型问题
+        # 数值化
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
 
         return df[["DateTime", "open", "high", "low", "close", "volume"]]
 
-    def fetch_klines_range(self, symbol, start_ms, end_ms):
-        frames, cur = [], start_ms
-        while True:
-            params = {"symbol": symbol, "interval": self.interval,
-                      "limit": MAX_LIMIT, "startTime": cur, "endTime": end_ms}
-            data = self._get_json("/fapi/v1/klines", params=params)
-            if not isinstance(data, list) or not data:
-                break
-            df = self._klines_to_df(data)
-            frames.append(df)
-            cur = int(data[-1][6]) + 1  # 下一页从上页 close_time+1ms
-            if cur > end_ms:
-                break
-            time.sleep(0.08)
-        if not frames:
-            return pd.DataFrame(columns=["DateTime","open","high","low","close","volume"])
-        out = pd.concat(frames, ignore_index=True)
-        out = out.drop_duplicates(subset=["DateTime"]).sort_values("DateTime").reset_index(drop=True)
-        return out
+    def fetch_klines_range(self, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+        frames: List[pd.DataFrame] = []
+        cur = start_ms
 
-    def earliest_kline_time(self, symbol):
-        """拿到该合约最早一根 K 的时间（用于判断是否≥1年历史）"""
-        data = self._get_json("/fapi/v1/klines", params={
-            "symbol": symbol, "interval": self.interval, "limit": 1, "startTime": 0
-        })
-        df = self._klines_to_df(data)
+        while True:
+            try:
+                data = self.binance.fetch_ohlcv(symbol, timeframe=self.interval, since=cur, limit=MAX_LIMIT)
+                if not data:
+                    break
+                df = self._ohlcv_to_df(data)
+                frames.append(df)
+
+                # 下一页：上一个最后时间 + 一个步长（1h）
+                last_ts = int(data[-1][0])
+                cur = last_ts + self.step_ms
+                if cur > end_ms:
+                    break
+
+                # 稍微退避，避免限流
+                time.sleep(0.08)
+            except Exception as e:
+                logger.warning(f"Error fetching data for {symbol}: {e}")
+                break
+
+        if frames:
+            result_df = pd.concat(frames, ignore_index=True)
+            result_df = result_df.drop_duplicates(subset=["DateTime"]).sort_values("DateTime").reset_index(drop=True)
+            return result_df
+        return pd.DataFrame(columns=["DateTime", "open", "high", "low", "close", "volume"])  # 返回空的 DataFrame
+
+
+
+    def earliest_kline_time(self, symbol: str):
+        """
+        获取该合约最早一根 K 的时间。
+        说明：Binance 通常对 since=0, limit=1 会返回最早一根；若返回为空则视为无数据。
+        """
+        data = self.binance.fetch_ohlcv(symbol, timeframe=self.interval, since=0, limit=1)
+        df = self._ohlcv_to_df(data)
         if df.empty:
             return None
         return df["DateTime"].iloc[0]
 
-# ---------- 辅助：时间网格补齐（可选） ----------
-def pad_to_hour_grid(df, start_dt, end_dt):
+
+# -------------------- 工具：时间、补齐 -------------------- #
+def ms_to_naive_dt(ms: int) -> datetime:
+    # 注意：Timestamp/Series 的“去时区”方式不同，这里是单个值（Timestamp），可直接 tz_localize(None)
+    return pd.to_datetime(ms, unit="ms", utc=True).tz_localize(None).to_pydatetime()
+
+
+def pad_to_hour_grid(df: pd.DataFrame, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
     """
-    对齐到整点网格 [start_dt, end_dt]，频率 1H。
-    缺失小时：volume=0；close前向填充；open/high/low=填充后close
+    将 df 对齐到 [start_dt, end_dt] 的整点网格（1H）。
+    缺失小时：
+      - volume = 0
+      - close 前向填充
+      - open/high/low = 填充后的 close
     """
     idx = pd.date_range(start=start_dt, end=end_dt, freq="1H")
     if df.empty:
-        base = pd.DataFrame({"DateTime": idx})
-        base["close"] = None
-        base["open"] = base["high"] = base["low"] = None
-        base["volume"] = 0.0
-        return base
+        out = pd.DataFrame({"DateTime": idx})
+        out["close"] = None
+        out["open"] = out["high"] = out["low"] = None
+        out["volume"] = 0.0
+        return out
 
-    for c in ["open","high","low","close","volume"]:
+    for c in ["open", "high", "low", "close", "volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     gdf = df.set_index("DateTime").reindex(idx)
     gdf["close"] = gdf["close"].ffill()
-    gdf["open"]  = gdf["open"].fillna(gdf["close"])
-    gdf["high"]  = gdf["high"].fillna(gdf["close"])
-    gdf["low"]   = gdf["low"].fillna(gdf["close"])
-    gdf["volume"]= gdf["volume"].fillna(0.0)
-    gdf = gdf.reset_index().rename(columns={"index":"DateTime"})
+    gdf["open"] = gdf["open"].fillna(gdf["close"])
+    gdf["high"] = gdf["high"].fillna(gdf["close"])
+    gdf["low"] = gdf["low"].fillna(gdf["close"])
+    gdf["volume"] = gdf["volume"].fillna(0.0)
+    gdf = gdf.reset_index().rename(columns={"index": "DateTime"})
     return gdf
 
-# ---------- 选择“历史≥1年 & 24h成交额Top-50”并抓取 ----------
-def fetch_top50_last_year_1h_history_ge_1y(pad_missing=False, out_dir="./data_crypho/", proxies=None):
-    """
-    选择条件：
-      1) USDT-M 永续，状态 TRADING
-      2) 在这些合约里按 24h 报价量降序
-      3) 逐个检查最早K线时间，只有“上市≥1年”的才入选，直到凑满50个
-    抓取：
-      最近一年 1h K线（时间对齐到当前整点）。可选 pad_missing 补齐为 8760 行。
-    """
+
+# -------------------- 顶层：历史 ≥1年 + 24h 成交额 Top-50 -------------------- #
+def fetch_top50_last_year_1h_history_ge_1y(pad_missing: bool = False,
+                                           out_dir: str = ".",
+                                           proxies: Optional[Dict[str, str]] = None) -> List[str]:
+
     client = BinanceFuturesUSDTClient(interval="1h", proxies=proxies)
 
     # 候选池：USDT-M 永续
     pool = client.fetch_usdt_perp_symbols()
-    # 先按 24h 成交额排序，取较大的候选集，方便筛掉历史不足1年的
-    ranked = client.top_by_quote_volume(pool, topn=max(200, len(pool)))
+    logger.info(f"USDT-M 永续候选数：{len(pool)}")
+    if not pool:
+        logger.warning("未获取到 USDT-M 永续合约列表。")
+        return []
+
+    # 先在池内按 24h 成交额排序，多拿一些作为候选（避免严格筛选后不够 50 个）
+    ranked = client.top_by_quote_volume(pool, topn=max(250, len(pool)))
     one_year_ago = datetime.utcnow() - timedelta(days=365)
 
-    selected = []
+    selected: List[str] = []
     for sym in ranked:
         if len(selected) >= 50:
             break
@@ -187,13 +281,16 @@ def fetch_top50_last_year_1h_history_ge_1y(pad_missing=False, out_dir="./data_cr
         logger.warning("No symbol satisfies 'history ≥ 1 year'.")
         return []
 
-    # 抓取最近1年窗口（恰好 8760 小时网格）
+    # 构造“一年整点网格”的时间窗口
     end_dt = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
     start_dt = end_dt - timedelta(hours=TARGET_ROWS_1Y_1H - 1)
     end_ms = int(end_dt.timestamp() * 1000)
     start_ms = int(start_dt.timestamp() * 1000)
 
-    saved = []
+    # 确保输出目录存在
+    os.makedirs(out_dir or ".", exist_ok=True)
+
+    saved: List[str] = []
     for sym in selected:
         try:
             logger.info(f"Fetching {sym} 1h last 1y ...")
@@ -206,7 +303,10 @@ def fetch_top50_last_year_1h_history_ge_1y(pad_missing=False, out_dir="./data_cr
             if len(df) > TARGET_ROWS_1Y_1H:
                 df = df.iloc[-TARGET_ROWS_1Y_1H:].reset_index(drop=True)
 
-            fn = f"{out_dir.rstrip('/')}/{sym}_1h_last1y.csv"
+            base_quote = sym.split(':')[0]
+            base_quote = base_quote.replace('/', '_')    # 将冒号和斜杠替换为下划线
+            fn = os.path.join(out_dir, f"{base_quote}.csv")  # 修改文件名格式为 "***_USDT.csv"
+
             df.to_csv(fn, index=False)
             logger.info(f"{sym}: saved {len(df)} rows -> {fn}")
             saved.append(fn)
@@ -214,3 +314,5 @@ def fetch_top50_last_year_1h_history_ge_1y(pad_missing=False, out_dir="./data_cr
             logger.warning(f"{sym}: failed, skip. {e}")
             continue
     return saved
+
+
