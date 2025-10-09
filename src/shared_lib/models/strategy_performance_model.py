@@ -24,7 +24,7 @@ class StrategyPerformanceModel:
     # 历史表现总权重（例如 0.35）
     total_weight: float = 0.35
 
-    # 子指标权重（默认值，可在外部覆盖）
+    # 子指标权重（默认值，可在外部修改，和需要是1）
     annual_return_weight: float = 0.25
     sharpe_weight: float = 0.20
     return_drawdown_weight: float = 0.20
