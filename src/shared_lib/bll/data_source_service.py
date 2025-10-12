@@ -67,7 +67,6 @@ class BinanceFuturesUSDTClient:
                 continue
 
             sym = m["symbol"]  # 形如 "BTC/USDT" 或 "BTC/USDT:USDT"
-
             # 假设我们使用市场的 `volume` 或其他字段作为市值的代理
             volume = float(m.get("volume", 0))  # 取交易量作为排序依据
 
