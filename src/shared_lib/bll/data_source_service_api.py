@@ -1,5 +1,7 @@
 import time
 import logging
+from typing import List
+
 import requests
 import pandas as pd
 from datetime import datetime, timedelta

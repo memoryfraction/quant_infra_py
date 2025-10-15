@@ -9,6 +9,8 @@ from utility import Utility
 import pandas as pd
 import ccxt
 
+from data_source_service_api import pad_to_hour_grid
+
 logger = logging.getLogger(__name__)
 
 MAX_LIMIT = 1500  # 单次 OHLCV 最大条数（ccxt->binance 支持到 1500）
@@ -197,8 +199,6 @@ class BinanceFuturesUSDTClient:
             return result_df
         return pd.DataFrame(columns=["DateTime", "open", "high", "low", "close", "volume"])  # 返回空的 DataFrame
 
-
-
     def earliest_kline_time(self, symbol: str):
         """
         获取该合约最早一根 K 的时间。
@@ -210,6 +210,7 @@ class BinanceFuturesUSDTClient:
             return None
         return df["DateTime"].iloc[0]
 
+<<<<<<< HEAD
 # -------------------- Binance 现货 USDT 客户端（基于 ccxt） -------------------- #
 class BinanceSpotUSDTClient:
     """
@@ -341,82 +342,89 @@ class BinanceSpotUSDTClient:
 def ms_to_naive_dt(ms: int) -> datetime:
     # 注意：Timestamp/Series 的“去时区”方式不同，这里是单个值（Timestamp），可直接 tz_localize(None)
     return pd.to_datetime(ms, unit="ms", utc=True).tz_localize(None).to_pydatetime()
+=======
+    # -------------------- 工具：时间、补齐 -------------------- #
+    def ms_to_naive_dt(self,ms: int) -> datetime:
+        # 注意：Timestamp/Series 的“去时区”方式不同，这里是单个值（Timestamp），可直接 tz_localize(None)
+        return pd.to_datetime(ms, unit="ms", utc=True).tz_localize(None).to_pydatetime()
+>>>>>>> 0f3d6a2 (调整了import)
 
 
-def pad_to_hour_grid(df: pd.DataFrame, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
-    """
-    将 df 对齐到 [start_dt, end_dt] 的整点网格（1H）。
-    缺失小时：
-      - volume = 0
-      - close 前向填充
-      - open/high/low = 填充后的 close
-    """
-    idx = pd.date_range(start=start_dt, end=end_dt, freq="1H")
-    if df.empty:
-        out = pd.DataFrame({"DateTime": idx})
-        out["close"] = None
-        out["open"] = out["high"] = out["low"] = None
-        out["volume"] = 0.0
-        return out
+    def pad_to_hour_grid(self,df: pd.DataFrame, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+        """
+        将 df 对齐到 [start_dt, end_dt] 的整点网格（1H）。
+        缺失小时：
+          - volume = 0
+          - close 前向填充
+          - open/high/low = 填充后的 close
+        """
+        idx = pd.date_range(start=start_dt, end=end_dt, freq="1H")
+        if df.empty:
+            out = pd.DataFrame({"DateTime": idx})
+            out["close"] = None
+            out["open"] = out["high"] = out["low"] = None
+            out["volume"] = 0.0
+            return out
 
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    gdf = df.set_index("DateTime").reindex(idx)
-    gdf["close"] = gdf["close"].ffill()
-    gdf["open"] = gdf["open"].fillna(gdf["close"])
-    gdf["high"] = gdf["high"].fillna(gdf["close"])
-    gdf["low"] = gdf["low"].fillna(gdf["close"])
-    gdf["volume"] = gdf["volume"].fillna(0.0)
-    gdf = gdf.reset_index().rename(columns={"index": "DateTime"})
-    return gdf
+        gdf = df.set_index("DateTime").reindex(idx)
+        gdf["close"] = gdf["close"].ffill()
+        gdf["open"] = gdf["open"].fillna(gdf["close"])
+        gdf["high"] = gdf["high"].fillna(gdf["close"])
+        gdf["low"] = gdf["low"].fillna(gdf["close"])
+        gdf["volume"] = gdf["volume"].fillna(0.0)
+        gdf = gdf.reset_index().rename(columns={"index": "DateTime"})
+        return gdf
 
 
-# -------------------- 顶层：历史 ≥1年 + 24h 成交额 Top-50 -------------------- #
-def fetch_top50_last_year_1h_history_ge_1y(pad_missing: bool = False,
-                                           out_dir: str = ".",
-                                           proxies: Optional[Dict[str, str]] = None) -> List[str]:
+    # -------------------- 顶层：历史 ≥1年 + 24h 成交额 Top-50 -------------------- #
+    def fetch_top50_last_year_1h_history_ge_1y(self,pad_missing: bool = False,
+                                               out_dir: str = ".",
+                                               proxies: Optional[Dict[str, str]] = None) -> List[str]:
 
-    client = BinanceFuturesUSDTClient(interval="1h", proxies=proxies)
+        client = BinanceFuturesUSDTClient(interval="1h", proxies=proxies)
 
-    # 候选池：USDT-M 永续
-    pool = client.fetch_usdt_perp_symbols()
-    logger.info(f"USDT-M 永续候选数：{len(pool)}")
-    if not pool:
-        logger.warning("未获取到 USDT-M 永续合约列表。")
-        return []
+        # 候选池：USDT-M 永续
+        pool = client.fetch_usdt_perp_symbols()
+        logger.info(f"USDT-M 永续候选数：{len(pool)}")
+        if not pool:
+            logger.warning("未获取到 USDT-M 永续合约列表。")
+            return []
 
-    # 先在池内按 24h 成交额排序，多拿一些作为候选（避免严格筛选后不够 50 个）
-    ranked = client.top_by_quote_volume(pool, topn=max(250, len(pool)))
-    one_year_ago = datetime.utcnow() - timedelta(days=365)
+        # 先在池内按 24h 成交额排序，多拿一些作为候选（避免严格筛选后不够 50 个）
+        ranked = client.top_by_quote_volume(pool, topn=max(250, len(pool)))
+        one_year_ago = datetime.utcnow() - timedelta(days=365)
 
-    selected: List[str] = []
-    for sym in ranked:
-        if len(selected) >= 50:
-            break
-        try:
-            t0 = client.earliest_kline_time(sym)
-            if t0 is None:
+        selected: List[str] = []
+        for sym in ranked:
+            if len(selected) >= 50:
+                break
+            try:
+                t0 = client.earliest_kline_time(sym)
+                if t0 is None:
+                    continue
+                if t0 <= one_year_ago:
+                    selected.append(sym)
+            except Exception as e:
+                logger.warning(f"{sym}: earliest time check failed, skip. {e}")
                 continue
-            if t0 <= one_year_ago:
-                selected.append(sym)
-        except Exception as e:
-            logger.warning(f"{sym}: earliest time check failed, skip. {e}")
-            continue
 
-    if not selected:
-        logger.warning("No symbol satisfies 'history ≥ 1 year'.")
-        return []
+        if not selected:
+            logger.warning("No symbol satisfies 'history ≥ 1 year'.")
+            return []
 
-    # 构造“一年整点网格”的时间窗口
-    end_dt = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
-    start_dt = end_dt - timedelta(hours=TARGET_ROWS_1Y_1H - 1)
-    end_ms = int(end_dt.timestamp() * 1000)
-    start_ms = int(start_dt.timestamp() * 1000)
+        # 构造“一年整点网格”的时间窗口
+        end_dt = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+        start_dt = end_dt - timedelta(hours=TARGET_ROWS_1Y_1H - 1)
+        end_ms = int(end_dt.timestamp() * 1000)
+        start_ms = int(start_dt.timestamp() * 1000)
 
-    # 确保输出目录存在
-    os.makedirs(out_dir or ".", exist_ok=True)
+        # 确保输出目录存在
+        os.makedirs(out_dir or ".", exist_ok=True)
 
+<<<<<<< HEAD
     saved: List[str] = []
     for sym in selected:
         try:
@@ -432,14 +440,22 @@ def fetch_top50_last_year_1h_history_ge_1y(pad_missing: bool = False,
                 continue
             logger.info(f"Fetching {sym} 1h last 1y ...")
             df = client.fetch_klines_range(sym, start_ms=start_ms, end_ms=end_ms)
+=======
+        saved: List[str] = []
+        for sym in selected:
+            try:
+                logger.info(f"Fetching {sym} 1h last 1y ...")
+                df = client.fetch_klines_range(sym, start_ms=start_ms, end_ms=end_ms)
+>>>>>>> 0f3d6a2 (调整了import)
 
-            if pad_missing:
-                df = pad_to_hour_grid(df, start_dt, end_dt)
+                if pad_missing:
+                    df = pad_to_hour_grid(df, start_dt, end_dt)
 
-            # 最终裁剪为 <= 8760 行（pad 模式下恰好 8760）
-            if len(df) > TARGET_ROWS_1Y_1H:
-                df = df.iloc[-TARGET_ROWS_1Y_1H:].reset_index(drop=True)
+                # 最终裁剪为 <= 8760 行（pad 模式下恰好 8760）
+                if len(df) > TARGET_ROWS_1Y_1H:
+                    df = df.iloc[-TARGET_ROWS_1Y_1H:].reset_index(drop=True)
 
+<<<<<<< HEAD
             # base_quote = sym.split(':')[0]
             # base_quote = base_quote.replace('/', '_')    # 将冒号和斜杠替换为下划线
             fn = os.path.join(out_dir, f"{base_quote}.csv")  # 修改文件名格式为 "***_USDT.csv"
@@ -530,4 +546,28 @@ def fetch_top50_last_year_1h_history_ge_1y_spot(pad_missing: bool = False,
 
     return saved
 
+=======
+                base_quote = sym.split(':')[0]
+                base_quote = base_quote.replace('/', '_')    # 将冒号和斜杠替换为下划线
+                fn = os.path.join(out_dir, f"{base_quote}.csv")  # 修改文件名格式为 "***_USDT.csv"
 
+                df.to_csv(fn, index=False)
+                logger.info(f"{sym}: saved {len(df)} rows -> {fn}")
+                saved.append(fn)
+            except Exception as e:
+                logger.warning(f"{sym}: failed, skip. {e}")
+                continue
+        return saved
+>>>>>>> 0f3d6a2 (调整了import)
+
+    def fetch_top50_last_year_1h_history_ge_1y_spot(self,pad_missing: bool = False,
+                                               out_dir: str = ".",
+                                               proxies: Optional[Dict[str, str]] = None):
+        """
+        TODO YHW 有待实现
+        :param pad_missing:
+        :param out_dir:
+        :param proxies:
+        :return:
+        """
+        pass
