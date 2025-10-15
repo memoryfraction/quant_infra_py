@@ -5,7 +5,6 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
 import pandas as pd
 import ccxt
-from data_source_service_api import pad_to_hour_grid
 logger = logging.getLogger(__name__)
 MAX_LIMIT = 1500  # 单次 OHLCV 最大条数（ccxt->binance 支持到 1500）
 TARGET_ROWS_1Y_1H = 8760  # 1 年 * 24 小时
@@ -203,6 +202,15 @@ class BinanceFuturesUSDTClient:
         if df.empty:
             return None
         return df["DateTime"].iloc[0]
+
+        # -------------------- 顶层：历史 ≥1年 + 24h 成交额 Top-50 -------------------- #
+
+    def fetch_top50_last_year_1h_history_ge_1y(self, pad_missing: bool = False,
+                                               out_dir: str = ".",
+                                               proxies: Optional[Dict[str, str]] = None) -> List[str]:
+
+        """ todo yhw 麻烦重新实现该方法"""
+
 
 # -------------------- Binance 现货 USDT 客户端（基于 ccxt） -------------------- #
 class BinanceSpotUSDTClient:
@@ -419,80 +427,3 @@ class BinanceSpotUSDTClient:
 
 
 
-    # -------------------- 顶层：历史 ≥1年 + 24h 成交额 Top-50（现货版） -------------------- #
-    def fetch_top50_last_year_1h_history_ge_1y_spot(pad_missing: bool = False,
-                                                    out_dir: str = ".",
-                                                    proxies: Optional[Dict[str, str]] = None) -> List[str]:
-        """
-        与期货函数同名风格：获取 USDT 现货 Top-50（按 24h 报价量），
-        且历史覆盖 ≥ 1 年，导出 1h 近一年数据到 CSV。已存在文件将跳过。
-        """
-        client = BinanceSpotUSDTClient(interval="1h", proxies=proxies)
-
-        # 候选池：USDT 现货
-        pool = client.fetch_usdt_spot_symbols()
-        logger.info(f"USDT 现货候选数：{len(pool)}")
-        if not pool:
-            logger.warning("未获取到 USDT 现货交易对列表。")
-            return []
-
-        # 排序并做历史长度筛选
-        ranked = client.top_by_quote_volume(pool, topn=max(250, len(pool)))
-        one_year_ago = datetime.utcnow() - timedelta(days=365)
-
-        selected: List[str] = []
-        for sym in ranked:
-            if len(selected) >= 50:
-                break
-            try:
-                t0 = client.earliest_kline_time(sym)
-                if t0 is None:
-                    continue
-                if t0 <= one_year_ago:
-                    selected.append(sym)
-            except Exception as e:
-                logger.warning(f"[现货] {sym}: earliest time check failed, skip. {e}")
-                continue
-
-        if not selected:
-            logger.warning("[现货] No symbol satisfies 'history ≥ 1 year'.")
-            return []
-
-        # 时间窗口（对齐到整点）
-        end_dt = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
-        start_dt = end_dt - timedelta(hours=TARGET_ROWS_1Y_1H - 1)
-        end_ms = int(end_dt.timestamp() * 1000)
-        start_ms = int(start_dt.timestamp() * 1000)
-
-        os.makedirs(out_dir or ".", exist_ok=True)
-
-        saved: List[str] = []
-        for sym in selected:
-            try:
-                # 文件名：沿用 "BASE_USDT.csv" 形式；与期货区分可自行加前缀，如 spot_*
-                base_quote = sym.replace('/', '_')  # 现货无 ":USDT" 后缀
-                fn = os.path.join(out_dir, f"{base_quote}.csv")
-
-                if os.path.exists(fn):
-                    logger.info(f"[现货] {sym}: 目标文件已存在，跳过 -> {fn}")
-                    # 如需把已存在文件也放回结果，解除下一行注释
-                    # saved.append(fn)
-                    continue
-
-                logger.info(f"[现货] Fetching {sym} 1h last 1y ...")
-                df = client.fetch_klines_range(sym, start_ms=start_ms, end_ms=end_ms)
-
-                if pad_missing:
-                    df = pad_to_hour_grid(df, start_dt, end_dt)
-
-                if len(df) > TARGET_ROWS_1Y_1H:
-                    df = df.iloc[-TARGET_ROWS_1Y_1H:].reset_index(drop=True)
-
-                df.to_csv(fn, index=False)
-                logger.info(f"[现货] {sym}: saved {len(df)} rows -> {fn}")
-                saved.append(fn)
-            except Exception as e:
-                logger.warning(f"[现货] {sym}: failed, skip. {e}")
-                continue
-
-        return saved
