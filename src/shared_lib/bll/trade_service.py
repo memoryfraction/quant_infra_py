@@ -92,6 +92,8 @@ class TradeService:
         symbol = self._normalize_symbol(symbol)
         market = self._get_market_or_raise(symbol)
 
+        # 强制设置杠杆为1x（不管传入什么杠杆值）
+        self.ex.set_leverage(1,  symbol)
         # 取价格：优先 markPrice，再退 last/close
         price = self._safe_price(symbol)
 
@@ -248,24 +250,24 @@ class TradeService:
         return step, min_notional
 
     def _quantize_amount(self, amount: float, market: Dict[str, Any]) -> float:
+        """
+        将数量量化为步进大小的整数倍，确保下单数量符合合约的精度要求。
+        """
+        # 获取步进大小（stepSize）
         prec = market.get("precision", {}).get("amount")
-        # precision 可能是整数（小数位）或浮点（步进）
-        if isinstance(prec, int):
-            fmt = "{:.%df}" % max(0, prec)
-            return float(fmt.format(float(amount)))
-        if isinstance(prec, float):
-            # 当作步进
-            if prec >= 1:
-                return float(int(round(float(amount) / prec)) * prec)
-            # 推导小数位
-            from math import floor, log10
-            try:
-                decimals = max(0, -int(floor(log10(prec))))
-            except Exception:
-                decimals = 8
-            fmt = "{:.%df}" % decimals
-            return float(fmt.format(float(amount)))
-        return float(amount)
+        step = None
+        for f in market.get("info", {}).get("filters", []):
+            if f["filterType"] == "LOT_SIZE":
+                step = float(f["stepSize"])
+
+        if step:
+            # 确保数量是步进的整数倍
+            q = round(amount / step) * step
+        else:
+            # 如果没有步进，按照精度量化
+            q = round(amount, prec or 8)
+
+        return q
 
     def _amount_for_min_notional(self, min_notional: float, price: float, market: Dict[str, Any]) -> float:
         # 用 Decimal 严格按 stepSize 向上取整

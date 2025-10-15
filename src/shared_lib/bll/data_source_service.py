@@ -3,7 +3,9 @@ import time
 import logging
 from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Tuple
-
+from enums import UnderlyingType
+from underlying import Underlying
+from utility import Utility
 import pandas as pd
 import ccxt
 
@@ -208,6 +210,132 @@ class BinanceFuturesUSDTClient:
             return None
         return df["DateTime"].iloc[0]
 
+# -------------------- Binance 现货 USDT 客户端（基于 ccxt） -------------------- #
+class BinanceSpotUSDTClient:
+    """
+    使用 ccxt 的 binance 现货客户端，仅筛 USDT 计价的现货交易对（非合约）。
+    """
+    def __init__(self, interval: str = "1h", proxies: Optional[Dict[str, str]] = None):
+        self.interval = interval
+        self.binance = ccxt.binance({
+            "enableRateLimit": True,
+        })
+        if proxies:
+            self.binance.proxies = proxies
+
+        # 显式加载市场
+        self.binance.load_markets(reload=True)
+        self.step_ms = int(self.binance.parse_timeframe(self.interval) * 1000)
+
+    def fetch_usdt_spot_symbols(self, top_n: int = 50) -> List[str]:
+        """
+        获取所有 USDT 计价的“现货”交易对符号，并按交易量粗排选出前 N 名。
+        """
+        markets = getattr(self.binance, "markets", None)
+        if not markets:
+            self.binance.load_markets(reload=True)
+            markets = self.binance.markets or {}
+
+        market_data: List[Tuple[str, float]] = []
+        for m in markets.values():
+            # 仅 USDT 计价
+            if m.get("quote") != "USDT":
+                continue
+            # 仅现货（非合约）
+            if m.get("spot") is not True:
+                continue
+            # 排除非活跃
+            if m.get("active") is False:
+                continue
+
+            sym = m["symbol"]          # 形如 "BTC/USDT"
+            volume = float(m.get("volume", 0))
+            market_data.append((sym, volume))
+
+        market_data.sort(key=lambda x: x[1], reverse=True)
+        syms = [sym for sym, _ in market_data[:top_n]]
+
+        logger.info(f"USDT 现货候选数：{len(syms)}")
+        if not syms:
+            logger.warning("未获取到 USDT 现货交易对列表。")
+        return syms
+
+    def top_by_quote_volume(self, pool: List[str], topn: int = 200) -> List[str]:
+        """
+        在 pool 里按 24h quoteVolume 排序，返回前 topn。
+        """
+        pool_set = set(pool)
+        rows: List[Tuple[str, float]] = []
+        try:
+            tickers = self.binance.fetch_tickers()
+        except Exception as e:
+            logger.warning(f"fetch_tickers 失败（现货），降级用 pool 顺序：{e}")
+            return pool[:topn]
+
+        for sym, t in tickers.items():
+            if sym not in pool_set:
+                continue
+            qv = t.get("quoteVolume")
+            if qv is None:
+                info = t.get("info") or {}
+                qv = info.get("quoteVolume")
+            if qv is None:
+                last = t.get("last") or 0
+                base_vol = t.get("baseVolume") or 0
+                try:
+                    qv = float(last) * float(base_vol)
+                except Exception:
+                    qv = 0.0
+            try:
+                qv_float = float(qv or 0.0)
+            except Exception:
+                qv_float = 0.0
+            rows.append((sym, qv_float))
+
+        if not rows:
+            logger.warning("tickers 中无匹配到的现货，降级使用 pool 顺序。")
+            return pool[:topn]
+
+        rows.sort(key=lambda x: x[1], reverse=True)
+        return [sym for sym, _ in rows[:topn]]
+
+    @staticmethod
+    def _ohlcv_to_df(raw: List[List]) -> pd.DataFrame:
+        # 与期货版一致，复用相同数据清洗规则
+        return BinanceFuturesUSDTClient._ohlcv_to_df(raw)
+
+    def fetch_klines_range(self, symbol: str, start_ms: int, end_ms: int) -> pd.DataFrame:
+        frames: List[pd.DataFrame] = []
+        cur = start_ms
+        while True:
+            try:
+                data = self.binance.fetch_ohlcv(symbol, timeframe=self.interval, since=cur, limit=MAX_LIMIT)
+                if not data:
+                    break
+                df = self._ohlcv_to_df(data)
+                frames.append(df)
+
+                last_ts = int(data[-1][0])
+                cur = last_ts + self.step_ms
+                if cur > end_ms:
+                    break
+                time.sleep(0.08)
+            except Exception as e:
+                logger.warning(f"[现货] 拉取 {symbol} 出错：{e}")
+                break
+
+        if frames:
+            result_df = pd.concat(frames, ignore_index=True)
+            result_df = result_df.drop_duplicates(subset=["DateTime"]).sort_values("DateTime").reset_index(drop=True)
+            return result_df
+        return pd.DataFrame(columns=["DateTime", "open", "high", "low", "close", "volume"])
+
+    def earliest_kline_time(self, symbol: str):
+        data = self.binance.fetch_ohlcv(symbol, timeframe=self.interval, since=0, limit=1)
+        df = self._ohlcv_to_df(data)
+        if df.empty:
+            return None
+        return df["DateTime"].iloc[0]
 
 # -------------------- 工具：时间、补齐 -------------------- #
 def ms_to_naive_dt(ms: int) -> datetime:
@@ -292,6 +420,16 @@ def fetch_top50_last_year_1h_history_ge_1y(pad_missing: bool = False,
     saved: List[str] = []
     for sym in selected:
         try:
+            # 【移动】把文件名的构造提前到循环一开始
+            base_quote = sym.split(':')[0].replace('/', '_')
+            fn = os.path.join(out_dir, f"{base_quote}.csv")
+
+            # 【新增】如果文件已存在，就跳过该交易对
+            if os.path.exists(fn):
+                logger.info(f"{sym}: 目标文件已存在，跳过 -> {fn}")
+                # 如需把已存在的文件也计入返回结果，可取消下一行注释
+                # saved.append(fn)
+                continue
             logger.info(f"Fetching {sym} 1h last 1y ...")
             df = client.fetch_klines_range(sym, start_ms=start_ms, end_ms=end_ms)
 
@@ -302,8 +440,8 @@ def fetch_top50_last_year_1h_history_ge_1y(pad_missing: bool = False,
             if len(df) > TARGET_ROWS_1Y_1H:
                 df = df.iloc[-TARGET_ROWS_1Y_1H:].reset_index(drop=True)
 
-            base_quote = sym.split(':')[0]
-            base_quote = base_quote.replace('/', '_')    # 将冒号和斜杠替换为下划线
+            # base_quote = sym.split(':')[0]
+            # base_quote = base_quote.replace('/', '_')    # 将冒号和斜杠替换为下划线
             fn = os.path.join(out_dir, f"{base_quote}.csv")  # 修改文件名格式为 "***_USDT.csv"
 
             df.to_csv(fn, index=False)
@@ -312,6 +450,84 @@ def fetch_top50_last_year_1h_history_ge_1y(pad_missing: bool = False,
         except Exception as e:
             logger.warning(f"{sym}: failed, skip. {e}")
             continue
+    return saved
+
+# -------------------- 顶层：历史 ≥1年 + 24h 成交额 Top-50（现货版） -------------------- #
+def fetch_top50_last_year_1h_history_ge_1y_spot(pad_missing: bool = False,
+                                                out_dir: str = ".",
+                                                proxies: Optional[Dict[str, str]] = None) -> List[str]:
+    """
+    与期货函数同名风格：获取 USDT 现货 Top-50（按 24h 报价量），
+    且历史覆盖 ≥ 1 年，导出 1h 近一年数据到 CSV。已存在文件将跳过。
+    """
+    client = BinanceSpotUSDTClient(interval="1h", proxies=proxies)
+
+    # 候选池：USDT 现货
+    pool = client.fetch_usdt_spot_symbols()
+    logger.info(f"USDT 现货候选数：{len(pool)}")
+    if not pool:
+        logger.warning("未获取到 USDT 现货交易对列表。")
+        return []
+
+    # 排序并做历史长度筛选
+    ranked = client.top_by_quote_volume(pool, topn=max(250, len(pool)))
+    one_year_ago = datetime.utcnow() - timedelta(days=365)
+
+    selected: List[str] = []
+    for sym in ranked:
+        if len(selected) >= 50:
+            break
+        try:
+            t0 = client.earliest_kline_time(sym)
+            if t0 is None:
+                continue
+            if t0 <= one_year_ago:
+                selected.append(sym)
+        except Exception as e:
+            logger.warning(f"[现货] {sym}: earliest time check failed, skip. {e}")
+            continue
+
+    if not selected:
+        logger.warning("[现货] No symbol satisfies 'history ≥ 1 year'.")
+        return []
+
+    # 时间窗口（对齐到整点）
+    end_dt = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+    start_dt = end_dt - timedelta(hours=TARGET_ROWS_1Y_1H - 1)
+    end_ms = int(end_dt.timestamp() * 1000)
+    start_ms = int(start_dt.timestamp() * 1000)
+
+    os.makedirs(out_dir or ".", exist_ok=True)
+
+    saved: List[str] = []
+    for sym in selected:
+        try:
+            # 文件名：沿用 "BASE_USDT.csv" 形式；与期货区分可自行加前缀，如 spot_*
+            base_quote = sym.replace('/', '_')  # 现货无 ":USDT" 后缀
+            fn = os.path.join(out_dir, f"{base_quote}.csv")
+
+            if os.path.exists(fn):
+                logger.info(f"[现货] {sym}: 目标文件已存在，跳过 -> {fn}")
+                # 如需把已存在文件也放回结果，解除下一行注释
+                # saved.append(fn)
+                continue
+
+            logger.info(f"[现货] Fetching {sym} 1h last 1y ...")
+            df = client.fetch_klines_range(sym, start_ms=start_ms, end_ms=end_ms)
+
+            if pad_missing:
+                df = pad_to_hour_grid(df, start_dt, end_dt)
+
+            if len(df) > TARGET_ROWS_1Y_1H:
+                df = df.iloc[-TARGET_ROWS_1Y_1H:].reset_index(drop=True)
+
+            df.to_csv(fn, index=False)
+            logger.info(f"[现货] {sym}: saved {len(df)} rows -> {fn}")
+            saved.append(fn)
+        except Exception as e:
+            logger.warning(f"[现货] {sym}: failed, skip. {e}")
+            continue
+
     return saved
 
 
