@@ -5,7 +5,7 @@ from enums import UnderlyingType
 
 @dataclass
 class Underlying:
-    name: str
+    symbol: str
     file_path: Path
     type: UnderlyingType
 
@@ -17,4 +17,4 @@ class Underlying:
             self.type = UnderlyingType(self.type)
 
     def __str__(self):
-        return f"Underlying(name={self.name}, type={self.type.value}, path={self.file_path})"
+        return f"Underlying(name={self.symbol}, type={self.type.value}, path={self.file_path})"

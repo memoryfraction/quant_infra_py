@@ -6,7 +6,7 @@ setup(
     packages=['shared_lib', 'shared_lib.tests'],
     url='',
     license='',
-    author='Rong Fan',
+    author='Rong Fan, HongWei Yuan',
     author_email='',
     description='standard shared library',
     install_requires=[
