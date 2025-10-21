@@ -4,12 +4,10 @@ import os
 from dotenv import dotenv_values, find_dotenv
 from typing import Dict, Any
 
-
 def read_and_print_config(env_file_name: str = ".env"):
     """
     查找、读取 .env 文件的内容，并格式化打印出来。
     """
-
     # 1. 查找 .env 文件路径
     try:
         # find_dotenv 会从当前目录开始向上层目录搜索文件
@@ -30,17 +28,18 @@ def read_and_print_config(env_file_name: str = ".env"):
     if not config_dict:
         print("警告：.env 文件为空或只包含注释。")
         return
-
+    returnvalue = None
     for key, value in config_dict.items():
         # 针对您提供的 OPENAI_API_KEY 格式化打印
         if key == "OPENAI_API_KEY" and value:
             # 打印您想要的部分，并隐藏机密信息的中间部分
             safe_value = f"{value[:5]}***{value[-4:]}"
+            returnvalue = value
             print(f"OPENAI_API_KEY: {safe_value}")
         else:
             print(f"{key}: {value}")
+    return returnvalue
 
-    print("----------------------------")
 
 
 if __name__ == "__main__":

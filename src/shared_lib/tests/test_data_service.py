@@ -152,7 +152,7 @@ class TestDataService(unittest.TestCase):
                 return datetime.utcnow() - timedelta(days=400)  # 历史>1年
 
             def fetch_klines_range(self, sym, start_ms, end_ms):
-                idx = pd.date_range(start=datetime(2024, 1, 1, 0, 0, 0), periods=5, freq="1H")
+                idx = pd.date_range(start=datetime(2024, 1, 1, 0, 0, 0), periods=5, freq="1h")
                 return pd.DataFrame({
                     "DateTime": idx,
                     "open": [1, 2, 3, 4, 5],
